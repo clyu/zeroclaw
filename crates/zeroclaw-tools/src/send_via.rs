@@ -43,21 +43,46 @@ pub struct TurnRoutingEntry {
 /// duration of the loop, and reads it back after the loop completes.
 pub type TurnRoutingHandle = Arc<Mutex<Vec<TurnRoutingEntry>>>;
 
-/// Static routing/modality wording that suggests a `send_via` call. Each entry
-/// is a multiword phrase that, taken whole, requests a destination or delivery
-/// modality — chosen to survive the trait's word-boundary matching contract
-/// without firing on ordinary prose. Deliberately excluded: bare deadline /
-/// style wording like "reply by" ("reply by Friday"), "respond by", "reply in"
+/// Which `send_via` call forms a registry advertises and accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendViaMode {
+    /// Immediate send (`body`) and the per-turn routing instruction (no
+    /// `body`). Only for registries whose turns scope a [`TURN_ROUTING`] handle
+    /// and read the queued routes back after the tool loop.
+    Full,
+    /// Immediate send only. The routing form is neither described nor
+    /// accepted, so a turn with nothing reading [`TURN_ROUTING`] back never
+    /// gets a call that could only come back `status: "ignored"`.
+    ImmediateOnly,
+}
+
+/// Static wording that suggests a `send_via` call. Each entry is a multiword
+/// phrase that, taken whole, requests a destination or delivery modality —
+/// chosen to survive the trait's word-boundary matching contract without
+/// firing on ordinary prose. Deliberately excluded: bare deadline / style
+/// wording like "reply by" ("reply by Friday"), "respond by", "reply in"
 /// ("reply in 5 minutes"), and "reply as" ("reply as soon as you can"), which
 /// carry no routing intent. Live channel and peer-group names are added per
 /// call on top.
-const STATIC_INVOCATION_TRIGGERS: &[&str] = &[
+///
+/// These entries ask for a message to be sent somewhere, which the immediate
+/// send serves in every [`SendViaMode`].
+const SEND_INVOCATION_TRIGGERS: &[&str] = &[
     "send this to",
     "send it to",
     "send that to",
     "send to my",
     "forward this to",
     "forward it to",
+    "via email",
+    "email this",
+    "email it",
+    "email me",
+];
+
+/// Wording that asks to change where or how this turn's own reply goes, which
+/// only the routing form serves - offered in [`SendViaMode::Full`] alone.
+const ROUTING_INVOCATION_TRIGGERS: &[&str] = &[
     "redirect to",
     "reply by voice",
     "reply by text",
@@ -68,10 +93,6 @@ const STATIC_INVOCATION_TRIGGERS: &[&str] = &[
     "voice message",
     "voice note",
     "text only",
-    "via email",
-    "email this",
-    "email it",
-    "email me",
 ];
 
 /// Dynamic trigger entries shorter than this are dropped. Word-boundary
@@ -86,9 +107,11 @@ pub struct SendViaTool {
     channel_map: PerToolChannelHandle,
     /// Resolves the active agent's peer groups live from config at call time.
     agent_peer_groups: AgentPeerGroupResolver,
+    mode: SendViaMode,
 }
 
 impl SendViaTool {
+    /// Builds a [`SendViaMode::Full`] tool; see [`Self::with_mode`].
     pub fn new(
         security: Arc<SecurityPolicy>,
         channel_map: PerToolChannelHandle,
@@ -98,7 +121,15 @@ impl SendViaTool {
             security,
             channel_map,
             agent_peer_groups,
+            mode: SendViaMode::Full,
         }
+    }
+
+    /// Restricts the call forms this tool advertises and accepts.
+    #[must_use]
+    pub fn with_mode(mut self, mode: SendViaMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Returns `true` if the peer group's `channel` field covers `channel_key`.
@@ -205,6 +236,23 @@ impl Tool for SendViaTool {
     }
 
     fn description(&self) -> &str {
+        if self.mode == SendViaMode::ImmediateOnly {
+            return "Send a separate message to another channel or peer group right away.\n\
+                    \n\
+                    WHEN TO USE: call this tool whenever the user asks you to send, forward, \
+                    or email something to a channel or contact — e.g. \"send this to my \
+                    email\", \"forward it to the family group\". Do not wait for the user to \
+                    name the tool.\n\
+                    \n\
+                    - `send_via(target: \"email.default\", body: \"...\")` — send `body` to the target\n\
+                    - `send_via(target: \"family\", body: \"...\", modality: \"voice\")` — send it as voice\n\
+                    `target` and `body` are both required. This tool does not change how or \
+                    where your own reply is delivered.\n\
+                    \n\
+                    `target` must be a channel alias (e.g. `telegram.default`) or a peer group \
+                    name the active agent belongs to. `modality` defaults to the peer group's \
+                    output_modality.";
+        }
         "Control where and how this turn's reply is delivered, or send an extra message \
          to another channel.\n\
          \n\
@@ -233,8 +281,13 @@ impl Tool for SendViaTool {
     }
 
     fn invocation_triggers(&self) -> Vec<String> {
-        let mut triggers: std::collections::BTreeSet<String> = STATIC_INVOCATION_TRIGGERS
+        let routing_triggers: &[&str] = match self.mode {
+            SendViaMode::Full => ROUTING_INVOCATION_TRIGGERS,
+            SendViaMode::ImmediateOnly => &[],
+        };
+        let mut triggers: std::collections::BTreeSet<String> = SEND_INVOCATION_TRIGGERS
             .iter()
+            .chain(routing_triggers)
             .map(|t| (*t).to_string())
             .collect();
 
@@ -273,6 +326,29 @@ impl Tool for SendViaTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        if self.mode == SendViaMode::ImmediateOnly {
+            return json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Channel alias (e.g. telegram.default) or peer group name \
+                                        to send to."
+                    },
+                    "modality": {
+                        "type": "string",
+                        "enum": ["text", "voice"],
+                        "description": "Delivery modality for this message. \
+                                        Omit to inherit from the peer group's output_modality."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Message content to send."
+                    }
+                },
+                "required": ["target", "body"]
+            });
+        }
         json!({
             "type": "object",
             "properties": {
@@ -410,6 +486,22 @@ impl Tool for SendViaTool {
         }
 
         // ── Routing instruction mode (no body) ───────────────────────────────
+        // Rejected before resolution or the `TURN_ROUTING` lookup: in this mode
+        // nothing reads a queued route back, even if a handle happens to be
+        // scoped.
+        if self.mode == SendViaMode::ImmediateOnly {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::json(json!({
+                    "status": "rejected",
+                    "reason": "`target` and `body` are required: this session can send a \
+                               separate message but cannot change how or where the current \
+                               reply is delivered"
+                })),
+                error: None,
+            });
+        }
+
         if target.is_none() && explicit_modality.is_none() {
             return Ok(ToolResult {
                 success: false,
@@ -596,6 +688,14 @@ mod tests {
         channels: Vec<(&str, Arc<dyn Channel>)>,
         peer_groups: HashMap<String, PeerGroupConfig>,
     ) -> (TestTool, TurnRoutingHandle) {
+        make_tool_with_mode(SendViaMode::Full, channels, peer_groups)
+    }
+
+    fn make_tool_with_mode(
+        mode: SendViaMode,
+        channels: Vec<(&str, Arc<dyn Channel>)>,
+        peer_groups: HashMap<String, PeerGroupConfig>,
+    ) -> (TestTool, TurnRoutingHandle) {
         let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         for (name, ch) in channels {
             map.write().insert(name.to_string(), ch);
@@ -606,7 +706,8 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             map,
             Arc::new(move || (*groups).clone()),
-        );
+        )
+        .with_mode(mode);
         let tool = TestTool {
             inner,
             routing: Arc::clone(&routing),
@@ -1161,6 +1262,128 @@ mod tests {
         );
         assert!(main_sent.read().is_empty());
         assert!(routing.lock().unwrap().is_empty());
+    }
+
+    // ── Immediate-only mode ───────────────────────────────────────────────────
+
+    /// `TestTool` scopes a live routing handle around every call, so each
+    /// rejection below comes from the mode itself, not from a missing handle.
+    #[tokio::test]
+    async fn immediate_only_rejects_every_routing_form() {
+        let ch = Arc::new(StubChannel::new("telegram.default"));
+        let sent = Arc::clone(&ch.sent);
+        let mut groups = HashMap::new();
+        groups.insert(
+            "g1".to_string(),
+            pg_with_peers("telegram", &["elisa"], &["@amaury"]),
+        );
+        let (tool, routing) = make_tool_with_mode(
+            SendViaMode::ImmediateOnly,
+            vec![("telegram.default", ch as Arc<dyn Channel>)],
+            groups,
+        );
+
+        for args in [
+            json!({ "modality": "voice" }),
+            json!({ "target": "telegram.default" }),
+            json!({ "target": "g1", "modality": "text" }),
+            json!({}),
+        ] {
+            let result = tool.execute(args.clone()).await.unwrap();
+            assert!(!result.success, "{args} must be rejected");
+            let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(out["status"], "rejected", "{args}");
+            assert!(
+                out["reason"].as_str().unwrap().contains("`body`"),
+                "{args} must be told the immediate send needs `body`, got {out}"
+            );
+        }
+        assert!(
+            routing.lock().unwrap().is_empty(),
+            "an immediate-only tool must never queue a route"
+        );
+        assert!(sent.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn immediate_only_still_delivers_body_sends() {
+        let ch = Arc::new(StubChannel::new("telegram.default"));
+        let sent = Arc::clone(&ch.sent);
+        let mut groups = HashMap::new();
+        groups.insert(
+            "amaury_tg".to_string(),
+            pg_with_peers("telegram", &["elisa"], &["@amaury"]),
+        );
+        let (tool, routing) = make_tool_with_mode(
+            SendViaMode::ImmediateOnly,
+            vec![("telegram.default", ch as Arc<dyn Channel>)],
+            groups,
+        );
+
+        let result = tool
+            .execute(json!({
+                "target": "amaury_tg",
+                "modality": "voice",
+                "body": "dinner at 7"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["mode"], "immediate");
+        assert_eq!(out["status"], "ok");
+        assert_eq!(sent.read().len(), 1);
+        assert_eq!(sent.read()[0].recipient, "@amaury");
+        assert!(sent.read()[0].force_voice);
+        assert!(routing.lock().unwrap().is_empty());
+    }
+
+    /// The model must not be invited to call a form the tool will reject:
+    /// schema, description, and triggers all drop the routing form together.
+    #[test]
+    fn immediate_only_advertises_only_the_immediate_form() {
+        fn has(triggers: &[String], trigger: &str) -> bool {
+            triggers.iter().any(|t| t == trigger)
+        }
+
+        let (full, _) = make_tool_with_mode(
+            SendViaMode::Full,
+            vec![("telegram.default", Arc::new(StubChannel::new("telegram")))],
+            HashMap::new(),
+        );
+        let (immediate, _) = make_tool_with_mode(
+            SendViaMode::ImmediateOnly,
+            vec![("telegram.default", Arc::new(StubChannel::new("telegram")))],
+            HashMap::new(),
+        );
+
+        assert!(full.inner.parameters_schema().get("required").is_none());
+        assert_eq!(
+            immediate.inner.parameters_schema()["required"],
+            json!(["target", "body"])
+        );
+
+        assert!(full.inner.description().contains("Without `body`"));
+        let description = immediate.inner.description();
+        assert!(
+            !description.contains("Without `body`") && !description.contains("reply by"),
+            "immediate-only description must not offer routing: {description}"
+        );
+
+        let full_triggers = full.inner.invocation_triggers();
+        let triggers = immediate.inner.invocation_triggers();
+        for send_wording in ["send this to", "email me", "telegram"] {
+            assert!(has(&full_triggers, send_wording), "{send_wording}");
+            assert!(has(&triggers, send_wording), "{send_wording}");
+        }
+        for routing_wording in ROUTING_INVOCATION_TRIGGERS {
+            assert!(has(&full_triggers, routing_wording), "{routing_wording}");
+            assert!(
+                !has(&triggers, routing_wording),
+                "immediate-only must not trigger on reply-format wording: {routing_wording}"
+            );
+        }
     }
 
     // ── Concurrency isolation ─────────────────────────────────────────────────

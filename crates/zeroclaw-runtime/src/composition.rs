@@ -350,6 +350,11 @@ pub struct NativeRecipeInputs<'a> {
     pub execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     /// A read view of ACP sessions, for entry points that serve ACP.
     pub acp_sessions: Option<crate::tools::AcpSessionReadView>,
+    /// Which `send_via` call forms turns served by this registry can honour;
+    /// `None` leaves the tool unregistered. Only a turn path that scopes a
+    /// `send_via::TURN_ROUTING` handle and reads the routes back may ask for
+    /// `Full`.
+    pub send_via_mode: Option<crate::tools::SendViaMode>,
 }
 
 /// A native compatibility recipe: builds the native registry for one eager
