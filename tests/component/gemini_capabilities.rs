@@ -13,12 +13,12 @@ fn gemini_model_provider() -> Box<dyn ModelProvider> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn gemini_reports_no_native_tool_calling() {
+fn gemini_reports_native_tool_calling() {
     let model_provider = gemini_model_provider();
     let caps = model_provider.capabilities();
     assert!(
-        !caps.native_tool_calling,
-        "Gemini should use prompt-guided tool calling, not native"
+        caps.native_tool_calling,
+        "Gemini should use native function calling"
     );
 }
 
@@ -30,11 +30,11 @@ fn gemini_reports_vision_support() {
 }
 
 #[test]
-fn gemini_supports_native_tools_returns_false() {
+fn gemini_supports_native_tools_returns_true() {
     let model_provider = gemini_model_provider();
     assert!(
-        !model_provider.supports_native_tools(),
-        "supports_native_tools() must be false to trigger prompt-guided fallback in chat()"
+        model_provider.supports_native_tools(),
+        "supports_native_tools() must be true so chat() sends functionDeclarations"
     );
 }
 
@@ -49,7 +49,7 @@ fn gemini_supports_vision_returns_true() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn gemini_convert_tools_returns_prompt_guided() {
+fn gemini_convert_tools_returns_function_declarations() {
     use zeroclaw::providers::traits::ToolsPayload;
     use zeroclaw::tools::ToolSpec;
 
@@ -68,8 +68,28 @@ fn gemini_convert_tools_returns_prompt_guided() {
     )];
 
     let payload = model_provider.convert_tools(&tools);
+    let ToolsPayload::Gemini {
+        function_declarations,
+    } = payload
+    else {
+        panic!("Gemini should return a native functionDeclarations payload");
+    };
+
+    assert_eq!(function_declarations.len(), 1);
+    assert_eq!(function_declarations[0]["name"], "memory_store");
+    assert_eq!(
+        function_declarations[0]["description"],
+        "Store a value in memory"
+    );
+    // `convert_tools` has no model to read a generation from, so it declares
+    // through the OpenAPI-subset field every Gemini generation accepts.
+    // `chat` picks `parametersJsonSchema` for generation 3 and newer.
+    assert_eq!(
+        function_declarations[0]["parameters"]["required"],
+        serde_json::json!(["key", "value"])
+    );
     assert!(
-        matches!(payload, ToolsPayload::PromptGuided { .. }),
-        "Gemini should return PromptGuided payload since native_tool_calling is false"
+        function_declarations[0].get("parametersJsonSchema").is_none(),
+        "the two parameter fields are mutually exclusive"
     );
 }
