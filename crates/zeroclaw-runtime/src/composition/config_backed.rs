@@ -203,6 +203,7 @@ pub fn native_compat_registry(
         live_config,
         execution_capability,
         acp_sessions,
+        send_via_mode,
     } = inputs;
     let config = request.config.as_ref();
     let risk_profile = config
@@ -244,6 +245,7 @@ pub fn native_compat_registry(
         live_config,
         execution_capability,
         acp_sessions,
+        send_via_mode,
     )
 }
 

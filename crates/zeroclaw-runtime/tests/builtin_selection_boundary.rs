@@ -87,6 +87,9 @@ async fn assemble_context(
         None,
         None,
         None,
+        // `send_via` is only registered when a mode is given; the full Chat
+        // fixture below lists it.
+        Some(zeroclaw_runtime::tools::SendViaMode::Full),
     )
     .unwrap();
     ScopedToolRegistry::assemble(ScopedAssembly {

@@ -500,9 +500,9 @@ pub struct DelegateTool {
     /// The daemon's shared live-config handle, when the registry that built
     /// this tool had one. `root_config` above is a *snapshot* taken at
     /// construction; every nested registry this tool builds must additionally
-    /// receive this handle so the target's per-execution resolvers (plugin
-    /// `[plugins.entries.config]`, `send_via` peer-group authority) follow
-    /// config reloads and credential rotation instead of the startup snapshot.
+    /// receive this handle so the target's per-execution plugin resolvers
+    /// (`[plugins.entries.config]`) follow config reloads and credential
+    /// rotation instead of the startup snapshot.
     /// `None` for one-shot / non-daemon callers, which keep the documented
     /// snapshot fallback.
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
@@ -1826,6 +1826,29 @@ impl DelegateTool {
                 live_config: self.live_config.clone(),
                 execution_capability: self.execution_capability.clone(),
                 acp_sessions: None,
+                // Never, regardless of the caller's scope. An independent target
+                // owns this registry, and this builder keeps only the assembled
+                // registry below and drops the returned channel handles - so the
+                // target's `send_via` would resolve against an empty channel map.
+                // Every call naming a `target` fails there, and immediate-send
+                // requires one, which leaves modality-only as the single form that
+                // "works": it writes into the CALLER's handle and restyles the
+                // parent channel turn's own reply, from an agent running under its
+                // own risk profile. `ImmediateOnly` would drop that form but keep
+                // only the calls that always fail here, so the target gets no
+                // `send_via` at all.
+                //
+                // A Bounded delegate is the deliberate contrast and needs no mode
+                // here: it reuses the caller's `parent_tools` wholesale, so it gets
+                // the caller's own `SendViaTool` - live channel map, the caller's
+                // mode, writing into the turn that is genuinely still its own when
+                // it runs on the caller's task. `execute_parallel` does not carry
+                // `TURN_ROUTING` onto its spawned workers; see the note there.
+                //
+                // Seeding target-owned channel handles from the live channel map is
+                // what would make a target's own `send_via` real; until then it has
+                // nothing it could honour.
+                send_via_mode: None,
             })?,
             None => crate::tools::supplied_registry_base()?,
         };
@@ -4207,6 +4230,11 @@ impl DelegateTool {
         // step scope this call was made under. Fanning work out must not widen
         // it any more than backgrounding it does.
         let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
+        // `send_via::TURN_ROUTING` is deliberately not carried onto the spawned
+        // workers, so a Bounded delegate's routing call here comes back
+        // `status: "ignored"`. Sharing the turn's handle would let siblings race
+        // on one queue whose `.last()` wins, and a worker outliving a timed-out
+        // or interrupted turn would keep writing into it.
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -9908,6 +9936,7 @@ mod tests {
                 live_config: None,
                 execution_capability: None,
                 acp_sessions: None,
+                send_via_mode: None,
             },
         )
         .unwrap();
@@ -19834,6 +19863,101 @@ target = "memory_recall"
         );
     }
 
+    /// An independent target never carries `send_via`, even when its allowlist
+    /// admits it. The target owns this registry and the builder drops its
+    /// channel handles, so the tool would resolve against an empty map: every
+    /// call naming a `target` fails, and modality-only routing would restyle
+    /// the CALLER's reply. Building the registry reads nothing from the caller's
+    /// turn scope, so one build covers channel and non-channel callers alike.
+    #[tokio::test]
+    async fn independent_target_never_receives_send_via() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        // The target allowlist admits `send_via`, so a missing tool below is the
+        // registration gate's doing rather than the per-agent policy filter's.
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string(), "send_via".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent target policy resolves");
+
+        let tools = tool
+            .independent_agentic_tools_for_target("target", Arc::clone(&target_policy))
+            .await
+            .expect("target-owned registry builds")
+            .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"shell"),
+            "positive control: the rest of the target's registry must still build, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"send_via"),
+            "the target's registry owns no channel map, so send_via must not register, \
+             got {names:?}"
+        );
+    }
+
     #[tokio::test]
     async fn independent_delegate_receives_target_skill_tools() {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
@@ -22665,6 +22789,7 @@ command = "rm independent-delegate-marker"
                     &config,
                     None,
                     false,
+                    None,
                     None,
                     None,
                     None,

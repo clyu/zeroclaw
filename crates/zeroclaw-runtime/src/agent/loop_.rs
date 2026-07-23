@@ -1818,6 +1818,10 @@ async fn run_inner(
                     .map(AgentExecutionCapability::config_handle),
                 execution_capability: execution_capability.clone(),
                 acp_sessions: None,
+                // CLI `run`: no channel orchestrator, so no `TURN_ROUTING` handle.
+                // This path seeds live channels into the shared ask_user handle
+                // below, so `send_via` immediate sends reach them.
+                send_via_mode: Some(tools::SendViaMode::ImmediateOnly),
             })?,
             None => tools::supplied_registry_base()?,
         };
@@ -3905,6 +3909,14 @@ async fn process_message_inner(
                 live_config: live_config.clone(),
                 execution_capability: execution_capability.clone(),
                 acp_sessions: None,
+                // `process_message` dispatches through `agent_turn`, which scopes no
+                // `TURN_ROUTING` handle. Unlike CLI `run`, its channel seeding below
+                // is conditional: the map comes from a process-wide factory that the
+                // `agent` command registers and the daemon does not. So `send_via`
+                // immediate sends reach a live channel only in a process that has
+                // one, which the in-process peer-message turn reaches; under the
+                // daemon they fail like the other tools sharing that empty map.
+                send_via_mode: Some(tools::SendViaMode::ImmediateOnly),
             })?,
             None => tools::supplied_registry_base()?,
         };
