@@ -9925,6 +9925,44 @@ mod tests {
         );
     }
 
+    /// A tool round folded back into agent history and re-emitted for the next
+    /// turn must still carry the provider's round-trip fields. Gemini 3 rejects
+    /// a replayed `functionCall` whose `thoughtSignature` went missing.
+    #[test]
+    fn replayed_tool_calls_keep_provider_extra_content() {
+        let loop_messages = vec![ChatMessage::assistant(
+            serde_json::json!({
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"ls\"}",
+                    "extra_content": {"google": {"thought_signature": "sig-1"}},
+                }],
+            })
+            .to_string(),
+        )];
+
+        let replayed = Agent::replay_loop_messages(&loop_messages, None);
+
+        let ConversationMessage::AssistantToolCalls { tool_calls, .. } = &replayed[0] else {
+            panic!("assistant tool-call envelope should replay as AssistantToolCalls");
+        };
+        assert_eq!(
+            tool_calls[0].extra_content,
+            Some(serde_json::json!({"google": {"thought_signature": "sig-1"}}))
+        );
+
+        // And it must survive the trip back out to the provider.
+        let provider_messages = NativeToolDispatcher.to_provider_messages(&replayed);
+        let envelope: serde_json::Value =
+            serde_json::from_str(&provider_messages[0].content).expect("envelope is JSON");
+        assert_eq!(
+            envelope["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+            "sig-1"
+        );
+    }
+
     #[test]
     fn seed_history_trims_over_cap_restore_and_returns_transport_event() {
         let capturing = Arc::new(CapturingObserver::default());
