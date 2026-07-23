@@ -134,14 +134,15 @@ impl AcpSessionStore {
              CREATE INDEX IF NOT EXISTS idx_acp_messages_session ON acp_messages(session_id, id);
 
              CREATE TABLE IF NOT EXISTS acp_tool_calls (
-                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                 message_id   INTEGER NOT NULL REFERENCES acp_messages(id) ON DELETE CASCADE,
-                 tool_call_id TEXT NOT NULL,
-                 tool_name    TEXT NOT NULL,
-                 event_kind   TEXT NOT NULL,
-                 payload      TEXT NOT NULL,
-                 outcome      TEXT,
-                 created_at   TEXT NOT NULL
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 message_id    INTEGER NOT NULL REFERENCES acp_messages(id) ON DELETE CASCADE,
+                 tool_call_id  TEXT NOT NULL,
+                 tool_name     TEXT NOT NULL,
+                 event_kind    TEXT NOT NULL,
+                 payload       TEXT NOT NULL,
+                 extra_content TEXT,
+                 outcome       TEXT,
+                 created_at    TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_acp_tool_calls_message ON acp_tool_calls(message_id, id);
              CREATE INDEX IF NOT EXISTS idx_acp_tool_calls_lookup  ON acp_tool_calls(tool_call_id);
@@ -171,6 +172,9 @@ impl AcpSessionStore {
             .context("Failed to migrate ACP session trim breadcrumb column")?;
         Self::ensure_principal_id_column(&conn)
             .context("Failed to migrate ACP session principal owner")?;
+
+        Self::ensure_tool_call_extra_content_column(&conn)
+            .context("Failed to migrate ACP tool-call extra_content column")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -416,6 +420,43 @@ impl AcpSessionStore {
         )
         .context("Failed to record inferred legacy trim_breadcrumb")?;
         Ok(())
+    }
+
+    /// Idempotent migration adding the `extra_content` column that stores a
+    /// tool call's provider-specific round-trip fields (Gemini 3 carries its
+    /// `thoughtSignature` here). Existing user databases predate this column;
+    /// a restored session that replays a function call without its signature
+    /// is rejected by the provider on the next turn, so add it if absent.
+    fn ensure_tool_call_extra_content_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_tool_calls)")
+            .context("Failed to inspect ACP tool-call schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP tool-call schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP tool-call schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP tool-call column name")?;
+            if column == "extra_content" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute("ALTER TABLE acp_tool_calls ADD COLUMN extra_content TEXT", []) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP tool-call extra_content column"),
+        }
     }
 
     /// Record a new session stamped with its owning principal (RFC 7141
@@ -953,7 +994,7 @@ impl AcpSessionStore {
         // tool_results (event_kind='out') in id order.
         let mut tc_stmt = conn
             .prepare(
-                "SELECT tool_call_id, tool_name, event_kind, payload
+                "SELECT tool_call_id, tool_name, event_kind, payload, extra_content
                  FROM acp_tool_calls WHERE message_id = ?1 ORDER BY id ASC",
             )
             .context("Failed to prepare tool_call query")?;
@@ -970,17 +1011,24 @@ impl AcpSessionStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()
                 .context("Failed to read tool_call rows")?;
-            for (tool_call_id, tool_name, event_kind, payload) in rows {
+            for (tool_call_id, tool_name, event_kind, payload, extra_content) in rows {
                 match event_kind.as_str() {
                     "in" => ins.push(ToolCall {
                         id: tool_call_id,
                         name: tool_name,
                         arguments: payload,
-                        extra_content: None,
+                        // NULL for rows written before this column existed, and
+                        // for providers that carry nothing here. A row that
+                        // somehow holds non-JSON degrades to `None` rather than
+                        // failing the whole session restore.
+                        extra_content: extra_content
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str(raw).ok()),
                     }),
                     "out" => outs.push(ToolResultMessage {
                         tool_call_id,
@@ -1219,14 +1267,15 @@ impl AcpSessionStore {
                     for tc in tool_calls {
                         tx.execute(
                             "INSERT INTO acp_tool_calls
-                               (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                               (message_id, tool_call_id, tool_name, event_kind, payload, extra_content, outcome, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
                             params![
                                 msg_id,
                                 tc.id,
                                 tc.name,
                                 ToolEventKind::In.as_str(),
                                 tc.arguments,
+                                tc.extra_content.as_ref().map(ToString::to_string),
                                 now,
                             ],
                         )
@@ -2127,7 +2176,9 @@ mod tests {
                     id: "tc-1".into(),
                     name: "shell".into(),
                     arguments: r#"{"command":"ls"}"#.into(),
-                    extra_content: None,
+                    extra_content: Some(
+                        serde_json::json!({"google": {"thought_signature": "sig-1"}}),
+                    ),
                 }],
                 reasoning_content: Some("think think".into()),
             },
@@ -2155,6 +2206,12 @@ mod tests {
                 assert_eq!(tool_calls[0].id, "tc-1");
                 assert_eq!(tool_calls[0].name, "shell");
                 assert_eq!(tool_calls[0].arguments, r#"{"command":"ls"}"#);
+                // Provider round-trip fields (Gemini 3 `thoughtSignature`)
+                // must survive a restore, or the next turn is rejected.
+                assert_eq!(
+                    tool_calls[0].extra_content,
+                    Some(serde_json::json!({"google": {"thought_signature": "sig-1"}}))
+                );
                 assert_eq!(reasoning_content.as_deref(), Some("think think"));
             }
             other => panic!("expected AssistantToolCalls, got {other:?}"),
@@ -2168,6 +2225,66 @@ mod tests {
                 assert_eq!(results[0].content, "file.txt\n");
             }
             other => panic!("expected ToolResults, got {other:?}"),
+        }
+    }
+
+    /// A database created before `extra_content` existed must gain the column
+    /// on open. Without the migration the first `append_turn` fails outright,
+    /// because the insert names a column the old table does not have.
+    #[test]
+    fn opening_a_pre_extra_content_database_migrates_and_still_loads() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // The old table shape, written by a daemon that predates the column.
+        let legacy = Connection::open(sessions_dir.join("acp-sessions.db")).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE acp_tool_calls (
+                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                     message_id   INTEGER NOT NULL,
+                     tool_call_id TEXT NOT NULL,
+                     tool_name    TEXT NOT NULL,
+                     event_kind   TEXT NOT NULL,
+                     payload      TEXT NOT NULL,
+                     outcome      TEXT,
+                     created_at   TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("sess-legacy", "alpha", "/tmp/proj", None)
+            .unwrap();
+        store
+            .append_turn(
+                "sess-legacy",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("task")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tc-1".into(),
+                            name: "shell".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let data = store.load_session("sess-legacy").unwrap().unwrap();
+        match &data.messages[1] {
+            ConversationMessage::AssistantToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls[0].id, "tc-1");
+                assert_eq!(tool_calls[0].extra_content, None);
+            }
+            other => panic!("expected AssistantToolCalls, got {other:?}"),
         }
     }
 
