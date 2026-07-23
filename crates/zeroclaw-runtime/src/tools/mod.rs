@@ -110,7 +110,7 @@ pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::send_via::{
-    AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
+    AgentPeerGroupResolver, SendViaMode, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
     AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
@@ -665,6 +665,9 @@ pub fn all_tools(
         None,
         None,
         None,
+        // No channel orchestrator behind this entry point, so no `TURN_ROUTING`
+        // handle is ever read back after its turns: immediate sends only.
+        Some(SendViaMode::ImmediateOnly),
     )
 }
 
@@ -1026,6 +1029,7 @@ pub fn all_tools_with_runtime(
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    send_via_mode: Option<SendViaMode>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_and_acp_sessions(
         config,
@@ -1050,6 +1054,7 @@ pub fn all_tools_with_runtime(
         sop_audit,
         live_config,
         None,
+        send_via_mode,
     )
 }
 
@@ -1085,6 +1090,14 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     acp_sessions: Option<AcpSessionReadView>,
+    // Which `send_via` call forms turns served by this registry can honour;
+    // `None` leaves the tool unregistered. `Full` only for the channel
+    // orchestrator: it is the sole path that scopes a `send_via::TURN_ROUTING`
+    // handle and reads the queued routes back. Turn paths without that reader
+    // pass `ImmediateOnly`. The two registries built inside a running turn (an
+    // independent delegate target, a nested SOP step) pass `None`: they own no
+    // channel map, so even an immediate send could only fail.
+    send_via_mode: Option<SendViaMode>,
 ) -> anyhow::Result<AllToolsResult> {
     let builder = move || {
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
@@ -1118,6 +1131,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
             sop_audit,
             live_config,
             acp_sessions,
+            send_via_mode,
         )
     };
     std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
@@ -1173,6 +1187,14 @@ fn all_tools_with_runtime_on_thread(
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     acp_sessions: Option<AcpSessionReadView>,
+    // Which `send_via` call forms turns served by this registry can honour;
+    // `None` leaves the tool unregistered. `Full` only for the channel
+    // orchestrator: it is the sole path that scopes a `send_via::TURN_ROUTING`
+    // handle and reads the queued routes back. Turn paths without that reader
+    // pass `ImmediateOnly`. The two registries built inside a running turn (an
+    // independent delegate target, a nested SOP step) pass `None`: they own no
+    // channel map, so even an immediate send could only fail.
+    send_via_mode: Option<SendViaMode>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -2068,7 +2090,29 @@ fn all_tools_with_runtime_on_thread(
     let ask_user_tool = AskUserTool::new(security.clone(), Arc::clone(&ask_user_tool_handle));
     tool_arcs.push(Arc::new(ask_user_tool));
 
-    {
+    // Per-turn output routing tool. Its routing form (no `body`) writes into the
+    // `TURN_ROUTING` task-local, and the channel orchestrator is the sole path
+    // that scopes a handle into it and reads the routes back after the tool
+    // loop. Registries serving RPC/TUI, gateway, CLI `run`, and one-shot turns
+    // have no such reader, so a routing call there could only come back
+    // `status: "ignored"` while implying the user's format request had been
+    // applied. Those paths register `ImmediateOnly`, which drops the routing
+    // form from the schema, description, and triggers and rejects it at call
+    // time, but keeps the immediate send (`body`): it resolves against the
+    // shared ask_user handle, which `loop_::run` seeds from the injected
+    // channel-map factory and the gateway WebSocket fills with every configured
+    // channel, so it reaches a live peer group there. Where nothing is seeded it
+    // fails like the other channel tools sharing that late-bound map.
+    //
+    // The two registries built inside a running turn - an independent delegate
+    // target and a nested SOP step - pass `None`: they own no channel map, so
+    // even an immediate send always fails, and a `Full` tool's modality-only
+    // routing would rewrite the PARENT turn's delivery from an agent under a
+    // different risk profile. A Bounded delegate is the deliberate contrast: it
+    // reuses the caller's `parent_tools`, so it carries the caller's own
+    // `SendViaTool` - real channel map, the caller's mode - rather than a
+    // target-owned one.
+    if let Some(mode) = send_via_mode {
         let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config.clone() {
             let alias = agent_alias.to_string();
             Arc::new(move || filter_agent_peer_groups(&live.read(), &alias))
@@ -2076,11 +2120,10 @@ fn all_tools_with_runtime_on_thread(
             let snapshot = filter_agent_peer_groups(root_config, agent_alias);
             Arc::new(move || snapshot.clone())
         };
-        tool_arcs.push(Arc::new(SendViaTool::new(
-            security.clone(),
-            ask_user_tool_handle,
-            agent_peer_groups,
-        )));
+        tool_arcs.push(Arc::new(
+            SendViaTool::new(security.clone(), ask_user_tool_handle, agent_peer_groups)
+                .with_mode(mode),
+        ));
     }
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
@@ -2243,10 +2286,10 @@ fn all_tools_with_runtime_on_thread(
         .with_skill_bundles(root_config.skill_bundles.clone())
         .with_root_config(config.clone())
         // `with_root_config` above is only a snapshot. Delegated targets get
-        // their own nested registry, whose plugin tools and `send_via`
-        // authority resolve per execution; without the shared handle they would
-        // resolve against that snapshot forever. Same contract as the
-        // `live_config` argument this function received.
+        // their own nested registry, whose plugin tools resolve per execution;
+        // without the shared handle they would resolve against that snapshot
+        // forever. Same contract as the `live_config` argument this function
+        // received.
         .with_live_config(live_config.clone())
         .with_caller_alias(agent_alias);
         let delegate_tool = Arc::new(delegate_tool);
@@ -2629,6 +2672,7 @@ mod tests {
             &cfg,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -3636,6 +3680,9 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            // `send_via` is only registered when the caller asks for a mode, so
+            // this test must opt in to observe the tool at all.
+            Some(SendViaMode::Full),
         )
         .expect("tool registry builds")
         .tools;
@@ -3643,7 +3690,7 @@ permissions = ["http_client"]
         let send_via = tools
             .iter()
             .find(|t| t.name() == "send_via")
-            .expect("send_via is always registered");
+            .expect("send_via is registered when a send_via mode is given");
         let triggers = send_via.invocation_triggers();
         assert!(
             triggers.iter().any(|t| t == "send this to"),
@@ -3696,6 +3743,7 @@ permissions = ["http_client"]
             false,
             None,
             Some(engine),
+            None,
             None,
             None,
         )
@@ -3846,6 +3894,7 @@ permissions = ["http_client"]
                 None,
                 None,
                 None,
+                None,
             )
             .expect("tool registry builds")
             .tools;
@@ -3936,6 +3985,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .expect("tool registry builds")
         .tools;
@@ -3950,6 +4000,79 @@ permissions = ["http_client"]
         assert!(
             names.contains(&"shell"),
             "positive control: ordinary tools should still register"
+        );
+    }
+
+    /// `send_via` writes routing instructions into the `TURN_ROUTING` task-local
+    /// and only the channel orchestrator reads a handle back. Registered in full
+    /// anywhere else, it hands the model a routing call that can only ever come
+    /// back `status: "ignored"`, so the registered form must track the mode the
+    /// caller asks for - while the immediate send survives outside channel turns.
+    #[test]
+    fn send_via_registration_follows_requested_mode() {
+        fn send_via_schema(
+            tmp: &TempDir,
+            send_via_mode: Option<SendViaMode>,
+        ) -> Option<serde_json::Value> {
+            let security = Arc::new(SecurityPolicy::default());
+            let mem_cfg = MemoryConfig {
+                backend: "markdown".into(),
+                ..MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> =
+                Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            let cfg = test_config(tmp);
+            all_tools_with_runtime(
+                Arc::new(Config::default()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                Arc::new(NativeRuntime::new()),
+                mem,
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                send_via_mode,
+            )
+            .expect("tool registry builds")
+            .tools
+            .iter()
+            .find(|t| t.name() == "send_via")
+            .map(|t| t.parameters_schema())
+        }
+
+        let tmp = TempDir::new().unwrap();
+        assert!(
+            send_via_schema(&tmp, None).is_none(),
+            "send_via must stay unregistered for registries that own no channel map \
+             (independent delegate target, nested SOP step)"
+        );
+
+        let immediate = send_via_schema(&tmp, Some(SendViaMode::ImmediateOnly))
+            .expect("RPC/TUI, gateway, and CLI run keep send_via for immediate sends");
+        assert_eq!(
+            immediate["required"],
+            serde_json::json!(["target", "body"]),
+            "without a TURN_ROUTING reader only the immediate send may be offered"
+        );
+
+        let full = send_via_schema(&tmp, Some(SendViaMode::Full))
+            .expect("the channel orchestrator registers send_via");
+        assert!(
+            full.get("required").is_none(),
+            "channel turns keep the routing form, which omits `body`"
         );
     }
 
@@ -3998,6 +4121,7 @@ permissions = ["http_client"]
             false,
             None,
             Some(engine),
+            None,
             None,
             None,
         )
@@ -4058,6 +4182,7 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            None,
         )
         .expect("first tool registry builds");
         let session_b = all_tools_with_runtime(
@@ -4081,6 +4206,7 @@ permissions = ["http_client"]
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            None,
             None,
         )
         .expect("second tool registry builds");
@@ -4210,6 +4336,7 @@ permissions = ["http_client"]
                 Some(shared_engine.clone()),
                 None,
                 None,
+                None,
             )
             .expect("tool registry builds")
             .tools
@@ -4303,6 +4430,7 @@ permissions = ["http_client"]
             &root_config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4787,6 +4915,7 @@ permissions = ["http_client"]
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
+                None,
                 None,
             )
             .expect("tool registry builds")
@@ -5446,6 +5575,7 @@ permissions = ["http_client"]
             &config,
             None,
             false,
+            None,
             None,
             None,
             None,

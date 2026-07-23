@@ -2345,6 +2345,13 @@ impl Agent {
             // pass `None` and keep the documented snapshot fallback.
             live_config.clone(),
             acp_sessions,
+            // `Agent::from_config` backs the RPC/TUI, ACP, gateway WebSocket, and
+            // one-shot turn paths. They drive `run_tool_call_loop` directly,
+            // without the channel orchestrator's per-turn `TURN_ROUTING` scope, so
+            // `send_via` routing could never be honoured here. Immediate sends
+            // still work wherever live channels reach the shared ask_user handle,
+            // as the WebSocket path registers them.
+            Some(tools::SendViaMode::ImmediateOnly),
         )?;
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -8831,6 +8838,85 @@ mod tests {
                 assert!(history.output.contains("durable previous answer"));
             })
             .await;
+    }
+
+    /// `Agent::from_config` backs the RPC/TUI, ACP, gateway WebSocket, and
+    /// one-shot paths. None of them scope a `TURN_ROUTING` handle and read the
+    /// queued routes back, so `send_via` must register immediate-only: kept for
+    /// sends, but with the routing form neither offered nor accepted.
+    #[tokio::test]
+    async fn from_config_registers_send_via_for_immediate_sends_only() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let agent = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent from config");
+
+        let schema = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "send_via")
+            .expect("send_via stays registered for immediate sends")
+            .parameters_schema();
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["target", "body"]),
+            "without a TURN_ROUTING reader only the immediate send may be offered"
+        );
+
+        // A live handle is scoped around the call, so a `Full` tool would queue
+        // this route and succeed; the rejection can only come from the mode.
+        let routing: tools::TurnRoutingHandle = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let result = tools::TURN_ROUTING
+            .scope(
+                Some(Arc::clone(&routing)),
+                agent.execute_tool_for_test("send_via", serde_json::json!({"modality": "voice"})),
+            )
+            .await
+            .expect("send_via registered")
+            .expect("send_via returns a structured result");
+        assert!(!result.success);
+        let out: serde_json::Value =
+            serde_json::from_str(&result.output).expect("send_via output is JSON");
+        assert_eq!(out["status"], "rejected", "got {out}");
+        assert!(
+            routing.lock().unwrap().is_empty(),
+            "an immediate-only send_via must never queue a route"
+        );
     }
 
     #[tokio::test]

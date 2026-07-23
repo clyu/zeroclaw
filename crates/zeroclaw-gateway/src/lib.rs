@@ -1118,6 +1118,12 @@ pub async fn run_gateway_with_plugin_webhooks(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                // Dashboard-agent listing: no turn runs against this registry at
+                // all. It mirrors the gateway's own turns, which build their own
+                // through `process_message` / `Agent::from_config` and carry
+                // `send_via` for immediate sends only, since no channel
+                // orchestrator reads a `TURN_ROUTING` handle back there.
+                Some(tools::SendViaMode::ImmediateOnly),
             )?;
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
@@ -1252,6 +1258,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
+            // Per-agent `/api/tools` listing: same `send_via` mode as the seed
+            // above.
+            Some(tools::SendViaMode::ImmediateOnly),
         )?;
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only

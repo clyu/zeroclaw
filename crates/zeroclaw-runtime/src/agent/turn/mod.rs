@@ -2756,6 +2756,21 @@ pub(crate) async fn assemble_owned_execution(
         Some(sop_engine),
         sop_audit,
         None,
+        // Never, regardless of the parent turn's scope. A step agent owns this
+        // registry, and this function takes only the assembled registry below
+        // and drops the returned channel handles — so the step's `send_via`
+        // would resolve against an empty channel map. Every call naming a
+        // `target` fails there, and immediate-send requires one, which leaves
+        // modality-only as the single form that "works": it writes into the
+        // PARENT's handle and restyles the parent turn's own reply, from a step
+        // agent running under its own risk profile and addressing nothing of its
+        // own. `ImmediateOnly` would drop that form but keep only the calls that
+        // always fail here, so the step gets no `send_via` at all.
+        //
+        // Seeding step-owned channel handles from the live channel map is what
+        // would make a step's own `send_via` real; until then it has nothing it
+        // could honour.
+        None,
     )?;
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -5411,6 +5426,76 @@ mod sop_step_reassembly_tests {
         // With no parent approval manager the child is non-interactive
         // (auto-deny), matching the headless driver.
         assert!(reader.approval.is_non_interactive());
+    }
+
+    /// A nested step never carries `send_via`, even when its allowlist admits
+    /// it. The step agent owns this registry and the assembler drops its channel
+    /// handles, so the tool would resolve against an empty map: every call
+    /// naming a `target` fails, and modality-only routing would restyle the
+    /// PARENT's reply. Assembly reads nothing from the parent's turn scope, so
+    /// one assembly covers channel and non-channel parents alike.
+    #[tokio::test]
+    async fn nested_step_never_receives_send_via() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, SopConfig,
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-sop-routing-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        // The allowlist admits `send_via`, so a missing tool below is the
+        // registration gate's doing rather than the per-agent policy filter's.
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_read".to_string(), "send_via".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let step = assemble_owned_execution(&config, "stepper", Arc::clone(&engine), None, None)
+            .await
+            .expect("step agent assembles");
+        let names = tool_names(&step.tools_registry);
+        assert!(
+            names.contains(&"file_read".to_string()),
+            "positive control: the step agent's scope must still assemble: {names:?}"
+        );
+        assert!(
+            !names.contains(&"send_via".to_string()),
+            "the step's registry owns no channel map, so send_via must not register: {names:?}"
+        );
     }
 
     /// A parent approval manager with a live back-channel survives delegation:

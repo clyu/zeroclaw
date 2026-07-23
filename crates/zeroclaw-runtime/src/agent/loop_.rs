@@ -1477,6 +1477,10 @@ pub async fn run(
             sop_engine,
             sop_audit,
             None,
+            // CLI `run`: no channel orchestrator, so no `TURN_ROUTING` handle.
+            // This path seeds live channels into the shared ask_user handle
+            // below, so `send_via` immediate sends reach them.
+            Some(tools::SendViaMode::ImmediateOnly),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -3186,6 +3190,14 @@ pub(crate) async fn process_message_shared(
             sop_engine,
             sop_audit,
             None,
+            // `process_message` dispatches through `agent_turn`, which scopes no
+            // `TURN_ROUTING` handle. Unlike CLI `run`, its channel seeding below
+            // is conditional: the map comes from a process-wide factory that the
+            // `agent` command registers and the daemon does not. So `send_via`
+            // immediate sends reach a live channel only in a process that has
+            // one, which the in-process peer-message turn reaches; under the
+            // daemon they fail like the other tools sharing that empty map.
+            Some(tools::SendViaMode::ImmediateOnly),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {

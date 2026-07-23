@@ -15920,6 +15920,10 @@ pub async fn start_channels_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
+            // This registry serves channel turns, which scope a per-turn
+            // `TURN_ROUTING` handle around `run_tool_call_loop` and read the
+            // queued routes back afterwards - so `send_via` routing belongs here.
+            Some(tools::SendViaMode::Full),
         )?;
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
