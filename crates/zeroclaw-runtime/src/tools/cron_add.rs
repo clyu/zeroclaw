@@ -199,9 +199,9 @@ impl Tool for CronAddTool {
                     "description": "Optional human-readable name for the job"
                 },
                 // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
-                // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
-                // is ever wired up, SchemaCleanr::clean_for_gemini must be applied before
-                // tool specs are sent. See src/tools/schema.rs.
+                // Gemini declares tools through `parametersJsonSchema`, which accepts
+                // oneOf and reads it as anyOf; the branches here are discriminated by
+                // `kind`, so at most one ever matches and the two are equivalent.
                 "schedule": {
                     "description": "When to run the job. Exactly one of four forms must be used. Prefer 'after' for relative one-shot reminders.",
                     "oneOf": [
