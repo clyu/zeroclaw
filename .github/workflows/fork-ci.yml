@@ -1,0 +1,79 @@
+name: Fork CI
+
+# Fork-only workflow. It lives in its own file so upstream merges never touch
+# it; every upstream workflow is disabled in the fork's Actions settings
+# (`gh workflow disable`) instead of being edited here.
+
+on:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      # Built separately, as the release workflow does, so zerocode's features
+      # do not unify into the zeroclaw binary.
+      - name: Build zeroclaw
+        run: cargo build --release --locked --bin zeroclaw
+      - name: Build zerocode
+        run: cargo build --release --locked -p zerocode
+      # Tar first: artifact zips drop the executable bit.
+      - name: Package
+        run: tar czf zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C target/release zeroclaw zerocode
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
+  test:
+    name: Test (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # A full-workspace debug build outgrows the hosted runner's free disk.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install test system dependencies
+        run: bash scripts/ci/apt_install.sh mold expect python3
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      # Same runner and scope as upstream's required `Test` job in ci.yml.
+      - name: Run tests
+        run: cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
