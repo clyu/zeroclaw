@@ -1886,6 +1886,7 @@ impl DelegateTool {
         // `retain` mutator - no unseal/reseal round-trip through a raw `Vec`.
         // Same set removed as before (`tool.name() != Self::NAME`).
         registry.retain(|tool| tool.name() != Self::NAME);
+        crate::tools::send_via_scope::withhold_send_via(&mut registry);
         if self.withholds_unrestricted_tools() {
             // Tools that cannot carry the caller's principal, and the skill
             // aliases and builders that would restore them, must not be
@@ -19834,6 +19835,102 @@ target = "memory_recall"
         assert!(
             !tool_names.contains(&"echo_tool"),
             "independent target must not inherit parent-only tools"
+        );
+    }
+
+    /// An independent target never carries `send_via`, even when its allowlist
+    /// admits it. The target owns this registry and the builder drops its
+    /// channel handles, so the tool would resolve against an empty map: every
+    /// call naming a `target` fails, and modality-only routing would restyle
+    /// the CALLER's reply. Building the registry reads nothing from the caller's
+    /// turn scope, so one build covers channel and non-channel callers alike.
+    #[tokio::test]
+    async fn independent_target_never_receives_send_via() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        // The target allowlist admits `send_via`, so a missing tool below is the
+        // withholding's doing rather than the per-agent policy filter's.
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string(), "send_via".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent target policy resolves");
+
+        let tools = tool
+            .independent_agentic_tools_for_target("target", target_policy)
+            .await
+            .expect("target-owned registry builds")
+            .tools;
+        let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        assert!(
+            tool_names.contains(&"shell"),
+            "positive control: the rest of the target's registry must still build, got {tool_names:?}"
+        );
+        assert!(
+            !tool_names.contains(&"send_via"),
+            "the target's registry owns no channel map, so send_via must not register, \
+             got {tool_names:?}"
         );
     }
 

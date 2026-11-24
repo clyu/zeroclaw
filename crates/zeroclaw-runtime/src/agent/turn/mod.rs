@@ -4393,7 +4393,8 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
         ..
     } = assembled;
     // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
-    let tools_registry = registry;
+    let mut tools_registry = registry;
+    crate::tools::send_via_scope::withhold_send_via(&mut tools_registry);
 
     let provider_ref = config
         .resolved_model_provider_for_agent(alias)
@@ -8038,6 +8039,84 @@ mod sop_step_reassembly_tests {
                 .error
                 .unwrap_or_default()
                 .contains("file_download.allowed_private_hosts")
+        );
+    }
+
+    /// A nested step never carries `send_via`, even when its allowlist admits
+    /// it. The step agent owns this registry and the assembler drops its channel
+    /// handles, so the tool would resolve against an empty map: every call
+    /// naming a `target` fails, and modality-only routing would restyle the
+    /// PARENT's reply. Assembly reads nothing from the parent's turn scope, so
+    /// one assembly covers channel and non-channel parents alike.
+    #[tokio::test]
+    async fn nested_step_never_receives_send_via() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, SopConfig,
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-sop-routing-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        // The allowlist admits `send_via`, so a missing tool below is the
+        // withholding's doing rather than the per-agent policy filter's.
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_read".to_string(), "send_via".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let step = assemble_owned_execution(
+            &config,
+            None,
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("step agent assembles");
+        let names = tool_names(&step.tools_registry);
+        assert!(
+            names.contains(&"file_read".to_string()),
+            "positive control: the step agent's scope must still assemble: {names:?}"
+        );
+        assert!(
+            !names.contains(&"send_via".to_string()),
+            "the step's registry owns no channel map, so send_via must not register: {names:?}"
         );
     }
 
